@@ -3,6 +3,7 @@ package dht
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -191,23 +192,32 @@ type messageSender struct {
 	s   inet.Stream
 	r   ggio.ReadCloser
 	w   bufferedWriteCloser
+	rch  chan chan requestResult
+	rctl chan struct{}
 	lk  sync.Mutex
 	p   peer.ID
 	dht *IpfsDHT
 
-	invalid   bool
+	invalid bool
+	// singleMes tracks the number of times a message or request has failed to
+	// send via this messageSender, triggering a stream reset if its limit is
+	// reached.
 	singleMes int
 }
+
+type requestResult struct {
+	mes *pb.Message
+	err error
+}
+
+const requestResultBuffer = 64
 
 // invalidate is called before this messageSender is removed from the strmap.
 // It prevents the messageSender from being reused/reinitialized and then
 // forgotten (leaving the stream open).
 func (ms *messageSender) invalidate() {
 	ms.invalid = true
-	if ms.s != nil {
-		ms.s.Reset()
-		ms.s = nil
-	}
+	ms.reset()
 }
 
 func (ms *messageSender) prepOrInvalidate() error {
@@ -224,6 +234,7 @@ func (ms *messageSender) prep() error {
 	if ms.invalid {
 		return fmt.Errorf("message sender has been invalidated")
 	}
+
 	if ms.s != nil {
 		return nil
 	}
@@ -233,11 +244,34 @@ func (ms *messageSender) prep() error {
 		return err
 	}
 
-	ms.r = ggio.NewDelimitedReader(nstr, inet.MessageSizeMax)
+	r := ggio.NewDelimitedReader(nstr, inet.MessageSizeMax)
+	rch := make(chan chan requestResult, requestResultBuffer)
+	rctl := make(chan struct{}, 1)
+	go ms.messageReceiver(rch, rctl, r)
+
+	ms.r = r
+	ms.rch = rch
+	ms.rctl = rctl
 	ms.w = newBufferedDelimitedWriter(nstr)
 	ms.s = nstr
 
 	return nil
+}
+
+// Resets the stream and shuts down the goroutine pump
+// Mutex must be locked.
+func (ms *messageSender) reset() {
+	if ms.s != nil {
+		close(ms.rch)
+		ms.s.Reset()
+		ms.s = nil
+	}
+}
+
+func (ms *messageSender) resetStream(s inet.Stream) {
+	if ms.s == s {
+		ms.reset()
+	}
 }
 
 // streamReuseTries is the number of times we will try to reuse a stream to a
@@ -246,20 +280,26 @@ func (ms *messageSender) prep() error {
 const streamReuseTries = 3
 
 func (ms *messageSender) SendMessage(ctx context.Context, pmes *pb.Message) error {
+	defer log.EventBegin(ctx, "SendMessage", ms.dht.self, ms.p, pmes).Done()
 	ms.lk.Lock()
-	defer ms.lk.Unlock()
 	retry := false
 	for {
+		if ms.singleMes > streamReuseTries {
+			ms.lk.Unlock()
+			return ms.sendMessageSingle(ctx, pmes)
+		}
+
 		if err := ms.prep(); err != nil {
+			ms.lk.Unlock()
 			return err
 		}
 
-		if err := ms.writeMsg(pmes); err != nil {
-			ms.s.Reset()
-			ms.s = nil
+		if err := ms.w.WriteMsg(pmes); err != nil {
+			ms.reset()
 
 			if retry {
 				log.Info("error writing message, bailing: ", err)
+				ms.lk.Unlock()
 				return err
 			} else {
 				log.Info("error writing message, trying again: ", err)
@@ -268,31 +308,37 @@ func (ms *messageSender) SendMessage(ctx context.Context, pmes *pb.Message) erro
 			}
 		}
 
-		log.Event(ctx, "dhtSentMessage", ms.dht.self, ms.p, pmes)
-
-		if ms.singleMes > streamReuseTries {
-			go inet.FullClose(ms.s)
-			ms.s = nil
-		} else if retry {
+		if retry {
 			ms.singleMes++
+			if ms.singleMes > streamReuseTries {
+				ms.reset()
+			}
 		}
 
+		ms.lk.Unlock()
 		return nil
 	}
 }
 
 func (ms *messageSender) SendRequest(ctx context.Context, pmes *pb.Message) (*pb.Message, error) {
-	ms.lk.Lock()
-	defer ms.lk.Unlock()
+	defer log.EventBegin(ctx, "SendRequest", ms.dht.self, ms.p, pmes).Done()
 	retry := false
 	for {
+		ms.lk.Lock()
+
+		if ms.singleMes > streamReuseTries {
+			ms.lk.Unlock()
+			return ms.sendRequestSingle(ctx, pmes)
+		}
+
 		if err := ms.prep(); err != nil {
+			ms.lk.Unlock()
 			return nil, err
 		}
 
 		if err := ms.writeMsg(pmes); err != nil {
-			ms.s.Reset()
-			ms.s = nil
+			ms.reset()
+			ms.lk.Unlock()
 
 			if retry {
 				log.Info("error writing message, bailing: ", err)
@@ -304,31 +350,78 @@ func (ms *messageSender) SendRequest(ctx context.Context, pmes *pb.Message) (*pb
 			}
 		}
 
-		mes := new(pb.Message)
-		if err := ms.ctxReadMsg(ctx, mes); err != nil {
-			ms.s.Reset()
-			ms.s = nil
+		resch := make(chan requestResult, 1)
+		select {
+		case ms.rch <- resch:
+		default:
+			// pipeline stall, log it and time it
+			evt := log.EventBegin(ctx, "SendRequestStall", ms.dht.self, ms.p, pmes)
+			select {
+			case ms.rch <- resch:
+				evt.Done()
+			case <-ctx.Done():
+				evt.Done()
+				ms.lk.Unlock()
+				return nil, ctx.Err()
+			case <-ms.dht.ctx.Done():
+				evt.Done()
+				ms.lk.Unlock()
+				return nil, ms.dht.ctx.Err()
+			}
+		}
 
+		rctl := ms.rctl
+		s := ms.s
+
+		ms.lk.Unlock()
+
+		rctx, cancel := context.WithTimeout(ctx, dhtReadMessageTimeout)
+		defer cancel()
+
+		var res requestResult
+		select {
+		case res = <-resch:
+
+		case <-rctx.Done():
+			// A read timeout will cause the entire pipeline to time out.
+			// So signal for a stream reset to avoid clogging subsequent requests.
+			select {
+			case <-ctx.Done():
+				// not a read timeout
+			default:
+				select {
+				case rctl <- struct{}{}:
+				default:
+				}
+			}
+
+			return nil, rctx.Err()
+
+		case <-ms.dht.ctx.Done():
+			return nil, ms.dht.ctx.Err()
+		}
+
+		if res.err != nil {
 			if retry {
-				log.Info("error reading message, bailing: ", err)
-				return nil, err
+				log.Info("error reading message, bailing: ", res.err)
+				return nil, res.err
 			} else {
-				log.Info("error reading message, trying again: ", err)
+				log.Info("error reading message, trying again: ", res.err)
 				retry = true
 				continue
 			}
 		}
 
-		log.Event(ctx, "dhtSentMessage", ms.dht.self, ms.p, pmes)
-
-		if ms.singleMes > streamReuseTries {
-			go inet.FullClose(ms.s)
-			ms.s = nil
-		} else if retry {
+		if retry {
+			ms.lk.Lock()
 			ms.singleMes++
+			if ms.singleMes > streamReuseTries {
+				ms.resetStream(s)
+			}
+			ms.lk.Unlock()
 		}
 
-		return mes, nil
+		return res.mes, nil
 	}
 }
 
@@ -337,6 +430,61 @@ func (ms *messageSender) writeMsg(pmes *pb.Message) error {
 		return err
 	}
 	return ms.w.Flush()
+}
+
+func (ms *messageSender) sendMessageSingle(ctx context.Context, pmes *pb.Message) error {
+	s, err := ms.dht.host.NewStream(ctx, ms.p, ms.dht.protocols...)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	w := ggio.NewDelimitedWriter(s)
+
+	err = w.WriteMsg(pmes)
+	if err != nil {
+		s.Reset()
+	}
+
+	return err
+}
+
+func (ms *messageSender) sendRequestSingle(ctx context.Context, pmes *pb.Message) (*pb.Message, error) {
+	s, err := ms.dht.host.NewStream(ctx, ms.p, ms.dht.protocols...)
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+
+	r := ggio.NewDelimitedReader(s, inet.MessageSizeMax)
+	w := ggio.NewDelimitedWriter(s)
+
+	if err := w.WriteMsg(pmes); err != nil {
+		s.Reset()
+		return nil, err
+	}
+
+	mes := new(pb.Message)
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- r.ReadMsg(mes)
+	}()
+
+	rctx, cancel := context.WithTimeout(ctx, dhtReadMessageTimeout)
+	defer cancel()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			return nil, err
+		}
+	case <-rctx.Done():
+		s.Reset()
+		return nil, rctx.Err()
+	}
+
+	return mes, nil
 }
 
 func (ms *messageSender) ctxReadMsg(ctx context.Context, mes *pb.Message) error {
@@ -355,5 +503,62 @@ func (ms *messageSender) ctxReadMsg(ctx context.Context, mes *pb.Message) error 
 		return ctx.Err()
 	case <-t.C:
 		return ErrReadTimeout
+	}
+}
+
+func (ms *messageSender) messageReceiver(rch chan chan requestResult, rctl chan struct{}, r ggio.ReadCloser) {
+loop:
+	for {
+		select {
+		case <-rctl:
+			// poll for reset due to timeouts first, there might be requests queued
+			break loop
+
+		default:
+			select {
+			case next, ok := <-rch:
+				if !ok {
+					return
+				}
+
+				mes := new(pb.Message)
+				err := r.ReadMsg(mes)
+				if err != nil {
+					next <- requestResult{err: err}
+					break loop
+				} else {
+					next <- requestResult{mes: mes}
+				}
+
+			case <-rctl:
+				break loop
+
+			case <-ms.dht.ctx.Done():
+				return
+			}
+		}
+	}
+
+	// reset once; needs to happen in a goroutine to avoid deadlock
+	// in case of pipeline stalls
+	go func(s inet.Stream) {
+		ms.lk.Lock()
+		ms.resetStream(s)
+		ms.lk.Unlock()
+	}(ms.s)
+
+	// drain the pipeline
+	err := errors.New("Stream has been abandoned due to earlier errors")
+	for {
+		select {
+		case next, ok := <-rch:
+			if !ok {
+				return
+			}
+			next <- requestResult{err: err}
+
+		case <-ms.dht.ctx.Done():
+			return
+		}
 	}
 }
