@@ -189,14 +189,14 @@ func (dht *IpfsDHT) messageSenderForPeer(p peer.ID) (*messageSender, error) {
 }
 
 type messageSender struct {
-	s   inet.Stream
-	r   ggio.ReadCloser
-	w   bufferedWriteCloser
+	s    inet.Stream
+	r    ggio.ReadCloser
+	w    bufferedWriteCloser
 	rch  chan chan requestResult
 	rctl chan struct{}
-	lk  sync.Mutex
-	p   peer.ID
-	dht *IpfsDHT
+	lk   sync.Mutex
+	p    peer.ID
+	dht  *IpfsDHT
 
 	invalid bool
 	// singleMes tracks the number of times a message or request has failed to
