@@ -139,10 +139,10 @@ func (dht *IpfsDHT) runBootstrap(ctx context.Context, cfg BootstrapConfig) error
 	randomID := func() peer.ID {
 		// 16 random bytes is not a valid peer id. it may be fine becuase
 		// the dht will rehash to its own keyspace anyway.
-		id := make([]byte, 16)
-		rand.Read(id)
-		id = u.Hash(id)
-		return peer.ID(id)
+		buf := make([]byte, 16)
+		rand.Read(buf)
+		id := u.Hash(buf)
+		return peer.ID(id.Binary())
 	}
 
 	// bootstrap sequentially, as results will compound
